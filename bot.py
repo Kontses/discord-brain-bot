@@ -7,7 +7,7 @@ from discord.ext import commands
 import chromadb
 from google import genai
 
-# --- Mini Web Server για να κρατάει το Render ενεργό ---
+# --- Mini Web Server για το Render ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -28,23 +28,39 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHAT_CHANNEL_ID = int(os.environ.get("CHAT_CHANNEL_ID", 0))
 
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# Custom Embedding Function μέσω Gemini API (μηδενική χρήση RAM στο Render)
+class GeminiEmbeddingFunction(chromadb.EmbeddingFunction):
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        response = client.models.embed_content(
+            model="text-embedding-004",
+            contents=input
+        )
+        return [e.values for e in response.embeddings]
+
+embed_fn = GeminiEmbeddingFunction()
 chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="discord_notes")
+collection = chroma_client.get_or_create_collection(
+    name="discord_notes",
+    embedding_function=embed_fn
+)
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 def batch_upsert_worker(docs, metas, ids):
-    """Εκτελείται σε background thread για να μην μπλοκάρει το Discord."""
-    # Χωρισμός σε batches των 50 μηνυμάτων
-    batch_size = 50
+    """Εκτελείται με ασφάλεια σε παρτίδες των 25 για το Gemini API"""
+    batch_size = 25
     for i in range(0, len(docs), batch_size):
-        collection.upsert(
-            documents=docs[i:i+batch_size],
-            metadatas=metas[i:i+batch_size],
-            ids=ids[i:i+batch_size]
-        )
+        try:
+            collection.upsert(
+                documents=docs[i:i+batch_size],
+                metadatas=metas[i:i+batch_size],
+                ids=ids[i:i+batch_size]
+            )
+        except Exception as e:
+            print(f"Σφάλμα κατά το batch: {e}")
 
 async def do_sync(channel_to_notify=None):
     if channel_to_notify:
@@ -60,8 +76,8 @@ async def do_sync(channel_to_notify=None):
                 continue
 
             try:
-                # Διαβάζει τα τελευταία 500 μηνύματα ανά κανάλι για ταχύτητα
-                async for msg in channel.history(limit=500):
+                # Διαβάζει τα τελευταία 300 μηνύματα ανά κανάλι για σταθερότητα
+                async for msg in channel.history(limit=300):
                     if msg.author.bot or not msg.content.strip():
                         continue
 
@@ -72,7 +88,7 @@ async def do_sync(channel_to_notify=None):
                         "jump_url": msg.jump_url
                     })
                     all_ids.append(str(msg.id))
-            except (discord.Forbidden, Exception):
+            except Exception:
                 continue
 
     if not all_docs:
@@ -81,14 +97,12 @@ async def do_sync(channel_to_notify=None):
         return
 
     if channel_to_notify:
-        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις. Δημιουργία ευρετηρίου...")
+        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις. Δημιουργία ευρετηρίου με Gemini Embeddings...")
 
-    # Τρέχουμε το βαρύ embedding σε ξεχωριστό thread
     await asyncio.to_thread(batch_upsert_worker, all_docs, all_metas, all_ids)
 
     if channel_to_notify:
         await channel_to_notify.send(f"✅ Ολοκληρώθηκε! Ευρετηριάστηκαν επιτυχώς {len(all_docs)} σημειώσεις.")
-    print(f"Συγχρονίστηκαν {len(all_docs)} σημειώσεις.")
 
 @bot.event
 async def on_ready():
@@ -104,43 +118,47 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # Απάντηση ΜΟΝΟ στο chat κανάλι και όχι σε εντολές
     if message.channel.id == CHAT_CHANNEL_ID and not message.content.startswith("!"):
         async with message.channel.typing():
-            # Αναζήτηση σε ξεχωριστό νήμα
-            results = await asyncio.to_thread(
-                collection.query,
-                query_texts=[message.content],
-                n_results=8
-            )
+            try:
+                results = await asyncio.to_thread(
+                    collection.query,
+                    query_texts=[message.content],
+                    n_results=7
+                )
 
-            retrieved = results['documents'][0] if results['documents'] else []
-            metas = results['metadatas'][0] if results['metadatas'] else []
+                retrieved = results['documents'][0] if results['documents'] else []
+                metas = results['metadatas'][0] if results['metadatas'] else []
 
-            context_blocks = []
-            for doc, meta in zip(retrieved, metas):
-                context_blocks.append(f"[{meta['channel']}] {doc}")
-            context = "\n---\n".join(context_blocks)
+                context_blocks = []
+                for doc, meta in zip(retrieved, metas):
+                    context_blocks.append(f"[{meta['channel']}] {doc}")
+                context = "\n---\n".join(context_blocks)
 
-            prompt = (
-                f"Σημειώσεις από διάφορα κανάλια του server μου:\n{context}\n\n"
-                f"Ερώτηση/Σκέψη: {message.content}"
-            )
+                prompt = (
+                    f"Σημειώσεις από διάφορα κανάλια του server μου:\n{context}\n\n"
+                    f"Ερώτηση/Σκέψη: {message.content}"
+                )
 
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=dict(
-                    system_instruction=(
-                        "Είσαι ο προσωπικός μου βοηθός σκέψης. Έχεις πρόσβαση στις σημειώσεις μου "
-                        "από τα κανάλια του Discord server μου (δίπλα σε κάθε σημείωση αναγράφεται το κανάλι [όνομα]). "
-                        "Απάντησε, σύγκρινε, συνδύασε ιδέες και ανάφερε από ποια κανάλια αντλείς πληροφορίες."
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=dict(
+                        system_instruction=(
+                            "Είσαι ο προσωπικός μου βοηθός σκέψης. Έχεις πρόσβαση στις σημειώσεις μου "
+                            "από τα κανάλια του Discord server μου (δίπλα σε κάθε σημείωση αναγράφεται το κανάλι [όνομα]). "
+                            "Απάντησε, σύγκρινε, συνδύασε ιδέες και ανάφερε από ποια κανάλια αντλείς πληροφορίες."
+                        )
                     )
                 )
-            )
 
-            reply = response.text
-            for i in range(0, len(reply), 1900):
-                await message.reply(reply[i:i+1900])
+                reply = response.text
+                for i in range(0, len(reply), 1900):
+                    await message.reply(reply[i:i+1900])
+
+            except Exception as e:
+                await message.reply(f"⚠️ Παρουσιάστηκε σφάλμα: {e}")
 
     await bot.process_commands(message)
 
