@@ -27,6 +27,10 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 CHAT_CHANNEL_ID = int(os.environ.get("CHAT_CHANNEL_ID", 0))
 
+# Διαβάζει τα επιλεγμένα κανάλια από τα Environment Variables (χωρισμένα με κόμμα)
+raw_channels = os.environ.get("TARGET_CHANNEL_IDS", "")
+TARGET_CHANNEL_IDS = [int(ch.strip()) for ch in raw_channels.split(",") if ch.strip()]
+
 client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Custom Embedding Function μέσω Gemini API (μηδενική χρήση RAM στο Render)
@@ -64,32 +68,42 @@ def batch_upsert_worker(docs, metas, ids):
 
 async def do_sync(channel_to_notify=None):
     if channel_to_notify:
-        await channel_to_notify.send("🔄 Έναρξη συλλογής σημειώσεων από όλα τα κανάλια...")
+        await channel_to_notify.send("🔄 Έναρξη συλλογής σημειώσεων από τα επιλεγμένα κανάλια...")
 
     all_docs = []
     all_metas = []
     all_ids = []
 
-    for guild in bot.guilds:
-        for channel in guild.text_channels:
-            if channel.id == CHAT_CHANNEL_ID:
-                continue
+    # Καθορισμός καναλιών: είτε η συγκεκριμένη λίστα είτε όλα εκτός από το chat
+    channels_to_scan = []
+    if TARGET_CHANNEL_IDS:
+        for ch_id in TARGET_CHANNEL_IDS:
+            ch = bot.get_channel(ch_id)
+            if ch:
+                channels_to_scan.append(ch)
+    else:
+        for guild in bot.guilds:
+            for ch in guild.text_channels:
+                if ch.id != CHAT_CHANNEL_ID:
+                    channels_to_scan.append(ch)
 
-            try:
-                # Διαβάζει τα τελευταία 300 μηνύματα ανά κανάλι για σταθερότητα
-                async for msg in channel.history(limit=300):
-                    if msg.author.bot or not msg.content.strip():
-                        continue
+    for channel in channels_to_scan:
+        try:
+            # limit=None: Διαβάζει ΟΛΑ τα μηνύματα από την αρχή του καναλιού!
+            async for msg in channel.history(limit=None):
+                if msg.author.bot or not msg.content.strip():
+                    continue
 
-                    all_docs.append(msg.content)
-                    all_metas.append({
-                        "channel": channel.name,
-                        "created_at": msg.created_at.isoformat(),
-                        "jump_url": msg.jump_url
-                    })
-                    all_ids.append(str(msg.id))
-            except Exception:
-                continue
+                all_docs.append(msg.content)
+                all_metas.append({
+                    "channel": channel.name,
+                    "created_at": msg.created_at.isoformat(),
+                    "jump_url": msg.jump_url
+                })
+                all_ids.append(str(msg.id))
+        except Exception as e:
+            print(f"Σφάλμα στο κανάλι {channel.name}: {e}")
+            continue
 
     if not all_docs:
         if channel_to_notify:
@@ -97,7 +111,7 @@ async def do_sync(channel_to_notify=None):
         return
 
     if channel_to_notify:
-        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις. Δημιουργία ευρετηρίου με Gemini Embeddings...")
+        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις σε {len(channels_to_scan)} κανάλια. Δημιουργία ευρετηρίου...")
 
     await asyncio.to_thread(batch_upsert_worker, all_docs, all_metas, all_ids)
 
@@ -137,7 +151,7 @@ async def on_message(message):
                 context = "\n---\n".join(context_blocks)
 
                 prompt = (
-                    f"Σημειώσεις από διάφορα κανάλια του server μου:\n{context}\n\n"
+                    f"Σημειώσεις από τα σημαντικά κανάλια του server μου:\n{context}\n\n"
                     f"Ερώτηση/Σκέψη: {message.content}"
                 )
 
@@ -146,8 +160,8 @@ async def on_message(message):
                     contents=prompt,
                     config=dict(
                         system_instruction=(
-                            "Είσαι ο προσωπικός μου βοηθός σκέψης. Έχεις πρόσβαση στις σημειώσεις μου "
-                            "από τα κανάλια του Discord server μου (δίπλα σε κάθε σημείωση αναγράφεται το κανάλι [όνομα]). "
+                            "Είσαι ο προσωπικός μου βοηθός σκέψης. Έχεις πρόσβαση στις προσωπικές μου σημειώσεις "
+                            "από τα επιλεγμένα κανάλια του Discord server μου (δίπλα σε κάθε σημείωση αναγράφεται το κανάλι [όνομα]). "
                             "Απάντησε, σύγκρινε, συνδύασε ιδέες και ανάφερε από ποια κανάλια αντλείς πληροφορίες."
                         )
                     )
