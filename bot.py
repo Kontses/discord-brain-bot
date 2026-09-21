@@ -1,4 +1,5 @@
 import os
+import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
@@ -34,49 +35,67 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-async def do_sync(channel_to_notify=None):
-    """Διαβάζει αυτόματα όλα τα κανάλια κειμένου εκτός από το chat κανάλι."""
-    if channel_to_notify:
-        await channel_to_notify.send("🔄 Έναρξη συγχρονισμού όλων των καναλιών του server...")
+def batch_upsert_worker(docs, metas, ids):
+    """Εκτελείται σε background thread για να μην μπλοκάρει το Discord."""
+    # Χωρισμός σε batches των 50 μηνυμάτων
+    batch_size = 50
+    for i in range(0, len(docs), batch_size):
+        collection.upsert(
+            documents=docs[i:i+batch_size],
+            metadatas=metas[i:i+batch_size],
+            ids=ids[i:i+batch_size]
+        )
 
-    total_indexed = 0
+async def do_sync(channel_to_notify=None):
+    if channel_to_notify:
+        await channel_to_notify.send("🔄 Έναρξη συλλογής σημειώσεων από όλα τα κανάλια...")
+
+    all_docs = []
+    all_metas = []
+    all_ids = []
+
     for guild in bot.guilds:
         for channel in guild.text_channels:
-            # Εξαιρούμε μόνο το κανάλι όπου μιλάμε με το bot
             if channel.id == CHAT_CHANNEL_ID:
                 continue
 
             try:
-                # Διαβάζει έως 1500 μηνύματα από κάθε κανάλι σημειώσεων
-                async for msg in channel.history(limit=1500):
+                # Διαβάζει τα τελευταία 500 μηνύματα ανά κανάλι για ταχύτητα
+                async for msg in channel.history(limit=500):
                     if msg.author.bot or not msg.content.strip():
                         continue
 
-                    collection.upsert(
-                        documents=[msg.content],
-                        metadatas=[{
-                            "channel": channel.name,
-                            "created_at": msg.created_at.isoformat(),
-                            "jump_url": msg.jump_url
-                        }],
-                        ids=[str(msg.id)]
-                    )
-                    total_indexed += 1
-            except discord.Forbidden:
+                    all_docs.append(msg.content)
+                    all_metas.append({
+                        "channel": channel.name,
+                        "created_at": msg.created_at.isoformat(),
+                        "jump_url": msg.jump_url
+                    })
+                    all_ids.append(str(msg.id))
+            except (discord.Forbidden, Exception):
                 continue
 
+    if not all_docs:
+        if channel_to_notify:
+            await channel_to_notify.send("⚠️ Δεν βρέθηκαν σημειώσεις.")
+        return
+
     if channel_to_notify:
-        await channel_to_notify.send(f"✅ Συγχρονίστηκαν επιτυχώς {total_indexed} σημειώσεις από όλα τα κανάλια!")
-    print(f"Συνολικά καταχωρήθηκαν {total_indexed} μηνύματα.")
+        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις. Δημιουργία ευρετηρίου...")
+
+    # Τρέχουμε το βαρύ embedding σε ξεχωριστό thread
+    await asyncio.to_thread(batch_upsert_worker, all_docs, all_metas, all_ids)
+
+    if channel_to_notify:
+        await channel_to_notify.send(f"✅ Ολοκληρώθηκε! Ευρετηριάστηκαν επιτυχώς {len(all_docs)} σημειώσεις.")
+    print(f"Συγχρονίστηκαν {len(all_docs)} σημειώσεις.")
 
 @bot.event
 async def on_ready():
     print(f"Συνδέθηκε ως: {bot.user}")
-    await do_sync()
 
 @bot.command()
 async def sync(ctx):
-    """Χειροκίνητος συγχρονισμός"""
     if ctx.channel.id == CHAT_CHANNEL_ID:
         await do_sync(ctx.channel)
 
@@ -85,11 +104,11 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Απάντηση μόνο στο dedicated κανάλι συζήτησης
     if message.channel.id == CHAT_CHANNEL_ID and not message.content.startswith("!"):
         async with message.channel.typing():
-            # 1. Σημασιολογική αναζήτηση στη βάση
-            results = collection.query(
+            # Αναζήτηση σε ξεχωριστό νήμα
+            results = await asyncio.to_thread(
+                collection.query,
                 query_texts=[message.content],
                 n_results=8
             )
@@ -97,7 +116,6 @@ async def on_message(message):
             retrieved = results['documents'][0] if results['documents'] else []
             metas = results['metadatas'][0] if results['metadatas'] else []
 
-            # Σύνθεση του context μαζί με το όνομα του αντίστοιχου καναλιού
             context_blocks = []
             for doc, meta in zip(retrieved, metas):
                 context_blocks.append(f"[{meta['channel']}] {doc}")
@@ -108,7 +126,6 @@ async def on_message(message):
                 f"Ερώτηση/Σκέψη: {message.content}"
             )
 
-            # 2. Κλήση Gemini Flash
             response = client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=prompt,
@@ -122,7 +139,6 @@ async def on_message(message):
             )
 
             reply = response.text
-            # Χωρισμός αν υπερβαίνει το όριο των 2000 χαρακτήρων του Discord
             for i in range(0, len(reply), 1900):
                 await message.reply(reply[i:i+1900])
 
