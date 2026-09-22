@@ -37,7 +37,7 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 class GeminiEmbeddingFunction(chromadb.EmbeddingFunction):
     def __call__(self, input: list[str]) -> list[list[float]]:
         response = client.models.embed_content(
-            model="text-embedding-004",
+            model="gemini-embedding-001",
             contents=input
         )
         return [e.values for e in response.embeddings]
