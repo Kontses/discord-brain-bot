@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -57,14 +58,27 @@ def batch_upsert_worker(docs, metas, ids):
     """Εκτελείται με ασφάλεια σε παρτίδες των 25 για το Gemini API"""
     batch_size = 25
     for i in range(0, len(docs), batch_size):
-        try:
-            collection.upsert(
-                documents=docs[i:i+batch_size],
-                metadatas=metas[i:i+batch_size],
-                ids=ids[i:i+batch_size]
-            )
-        except Exception as e:
-            print(f"Σφάλμα κατά το batch: {e}")
+        success = False
+        retries = 3
+        while not success and retries > 0:
+            try:
+                collection.upsert(
+                    documents=docs[i:i+batch_size],
+                    metadatas=metas[i:i+batch_size],
+                    ids=ids[i:i+batch_size]
+                )
+                success = True
+                # Περιμένουμε λίγο για να μην χτυπήσουμε το όριο των 100 requests/minute
+                time.sleep(2)
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                    print(f"⚠️ API Limit hit. Waiting 60 seconds... (Batch {i})")
+                    time.sleep(60)
+                    retries -= 1
+                else:
+                    print(f"Σφάλμα κατά το batch: {e}")
+                    break
 
 async def do_sync(channel_to_notify=None):
     if channel_to_notify:
