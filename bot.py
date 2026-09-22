@@ -59,7 +59,7 @@ def batch_upsert_worker(docs, metas, ids):
     batch_size = 25
     for i in range(0, len(docs), batch_size):
         success = False
-        retries = 3
+        retries = 5
         while not success and retries > 0:
             try:
                 collection.upsert(
@@ -68,8 +68,8 @@ def batch_upsert_worker(docs, metas, ids):
                     ids=ids[i:i+batch_size]
                 )
                 success = True
-                # Περιμένουμε λίγο για να μην χτυπήσουμε το όριο των 100 requests/minute
-                time.sleep(2)
+                # Περιμένουμε 15 δευτερόλεπτα για να είμαστε ΑΠΟΛΥΤΑ ασφαλείς κάτω από τα 100 RPM
+                time.sleep(15)
             except Exception as e:
                 error_msg = str(e)
                 if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
@@ -119,18 +119,32 @@ async def do_sync(channel_to_notify=None):
             print(f"Σφάλμα στο κανάλι {channel.name}: {e}")
             continue
 
-    if not all_docs:
+    # Φιλτράρισμα: Κρατάμε ΜΟΝΟ τις σημειώσεις που ΔΕΝ υπάρχουν ήδη στο ευρετήριο!
+    existing_data = collection.get(include=[])
+    existing_ids = set(existing_data['ids']) if existing_data and 'ids' in existing_data else set()
+    
+    new_docs = []
+    new_metas = []
+    new_ids = []
+    
+    for doc, meta, i in zip(all_docs, all_metas, all_ids):
+        if i not in existing_ids:
+            new_docs.append(doc)
+            new_metas.append(meta)
+            new_ids.append(i)
+
+    if not new_docs:
         if channel_to_notify:
-            await channel_to_notify.send("⚠️ Δεν βρέθηκαν σημειώσεις.")
+            await channel_to_notify.send("✅ Δεν υπάρχουν νέες σημειώσεις. Το ευρετήριο είναι ήδη πλήρως ενημερωμένο!")
         return
 
     if channel_to_notify:
-        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(all_docs)} σημειώσεις σε {len(channels_to_scan)} κανάλια. Δημιουργία ευρετηρίου...")
+        await channel_to_notify.send(f"⏳ Βρέθηκαν {len(new_docs)} ΝΕΕΣ σημειώσεις. Προσθήκη στο ευρετήριο...")
 
-    await asyncio.to_thread(batch_upsert_worker, all_docs, all_metas, all_ids)
+    await asyncio.to_thread(batch_upsert_worker, new_docs, new_metas, new_ids)
 
     if channel_to_notify:
-        await channel_to_notify.send(f"✅ Ολοκληρώθηκε! Ευρετηριάστηκαν επιτυχώς {len(all_docs)} σημειώσεις.")
+        await channel_to_notify.send(f"✅ Ολοκληρώθηκε! Προστέθηκαν επιτυχώς {len(new_docs)} νέες σημειώσεις.")
 
 @bot.event
 async def on_ready():
