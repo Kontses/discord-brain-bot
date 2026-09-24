@@ -106,18 +106,35 @@ async def on_message(message):
                     f"Ερώτηση/Σκέψη του χρήστη: {message.content}"
                 )
 
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model="gemini-3.8-flash",
-                    contents=prompt,
-                    config=dict(
-                        system_instruction=(
-                            "Είσαι ο προσωπικός μου βοηθός σκέψης. Σου έχω δώσει παραπάνω ΟΛΕΣ τις σημειώσεις μου. "
-                            "Απάντησε στην Ερώτηση/Σκέψη μου, συνδυάζοντας ιδέες από τις σημειώσεις μου αν χρειάζεται. "
-                            "Ανάφερε σε παρένθεση από ποια κανάλια/ημερομηνίες αντλείς πληροφορίες."
+                try:
+                    response = await asyncio.to_thread(
+                        client.models.generate_content,
+                        model="gemini-3.8-flash",
+                        contents=prompt,
+                        config=dict(
+                            system_instruction=(
+                                "Είσαι ο προσωπικός μου βοηθός σκέψης. Σου έχω δώσει παραπάνω ΟΛΕΣ τις σημειώσεις μου. "
+                                "Απάντησε στην Ερώτηση/Σκέψη μου, συνδυάζοντας ιδέες από τις σημειώσεις μου αν χρειάζεται. "
+                                "Ανάφερε σε παρένθεση από ποια κανάλια/ημερομηνίες αντλείς πληροφορίες."
+                            )
                         )
                     )
-                )
+                except Exception as api_err:
+                    if "503" in str(api_err):
+                        response = await asyncio.to_thread(
+                            client.models.generate_content,
+                            model="gemini-3.5-flash",
+                            contents=prompt,
+                            config=dict(
+                                system_instruction=(
+                                    "Είσαι ο προσωπικός μου βοηθός σκέψης. Σου έχω δώσει παραπάνω ΟΛΕΣ τις σημειώσεις μου. "
+                                    "Απάντησε στην Ερώτηση/Σκέψη μου, συνδυάζοντας ιδέες από τις σημειώσεις μου αν χρειάζεται. "
+                                    "Ανάφερε σε παρένθεση από ποια κανάλια/ημερομηνίες αντλείς πληροφορίες."
+                                )
+                            )
+                        )
+                    else:
+                        raise api_err
 
                 reply = response.text
                 for i in range(0, len(reply), 1900):
